@@ -701,6 +701,9 @@ class SyncEngine private constructor() {
         }
     }
 
+    /** 每次剪贴板变化递增；等待 URI 就绪期间若剪贴板又变了，旧的等待作废 */
+    private val clipGeneration = java.util.concurrent.atomic.AtomicLong(0)
+
     private val clipChangedListener = android.content.ClipboardManager.OnPrimaryClipChangedListener {
         val ctx = appContext ?: return@OnPrimaryClipChangedListener
         val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE)
@@ -708,8 +711,10 @@ class SyncEngine private constructor() {
         // 主线程仅取 ClipData 快照；provider 查询（跨进程 Binder）转后台执行
         val clip = cm.primaryClip ?: return@OnPrimaryClipChangedListener
         val serverKey = config.serverStorageKey()
+        val generation = clipGeneration.incrementAndGet()
         scope.launch {
-            val content = extractFromClip(ctx, clip) ?: return@launch
+            val content = extractFromClip(ctx, clip) { clipGeneration.get() != generation }
+                ?: return@launch
             onLocalClipboardChanged(content, serverKey = serverKey)
         }
     }
@@ -794,9 +799,10 @@ class SyncEngine private constructor() {
      * 关键：必须优先检查 item.uri，因为图片剪贴板中 item.text 可能返回文件名而非 null，
      * 导致图片被误当作文本处理。
      */
-    private fun extractFromClip(
+    private suspend fun extractFromClip(
         context: Context,
-        clip: android.content.ClipData
+        clip: android.content.ClipData,
+        isStale: () -> Boolean = { false }
     ): ClipboardContent? {
         if (clip.itemCount == 0) return null
         val item = clip.getItemAt(0)
@@ -804,9 +810,11 @@ class SyncEngine private constructor() {
         // 优先处理 URI（图片/文件）
         val uri = item.uri
         if (uri != null) {
+            // 截图等场景：剪贴板先拿到 URI，文件要过几秒才发布。等发布后再读，否则读到 0 字节。
+            if (!awaitUriReady(context, uri, isStale)) return null
             val isImage = isImageUri(context, clip.description, uri)
             val type = if (isImage) ClipboardContentType.Image else ClipboardContentType.File
-            val fileName = uri.lastPathSegment ?: "file_${System.currentTimeMillis()}"
+            val fileName = resolveClipFileName(context, clip.description, uri)
             val fileSize = queryFileSize(context, uri)
 
             Logger.debug(TAG, "Extracted URI content: type=$type, name=$fileName, size=$fileSize")
@@ -866,6 +874,133 @@ class SyncEngine private constructor() {
                 if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getLong(0) else null
             }
         } catch (_: Exception) { null }
+    }
+
+    /** 查询 provider 提供的真实文件名（OpenableColumns.DISPLAY_NAME） */
+    private fun queryDisplayName(context: Context, uri: android.net.Uri): String? {
+        return try {
+            context.contentResolver.query(
+                uri,
+                arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                null, null, null
+            )?.use { cursor ->
+                if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getString(0) else null
+            }
+        } catch (_: Exception) { null }
+    }
+
+    /**
+     * 剪贴板 URI 的文件名：优先 DISPLAY_NAME，其次 URI 最后一段（只取文件名部分），
+     * 缺扩展名时按 MIME 补上。
+     */
+    private fun resolveClipFileName(
+        context: Context,
+        desc: android.content.ClipDescription,
+        uri: android.net.Uri
+    ): String {
+        val mime = runCatching { context.contentResolver.getType(uri) }.getOrNull()
+            ?: (0 until desc.mimeTypeCount).map { desc.getMimeType(it) }
+                .firstOrNull { !it.contains('*') && it != android.content.ClipDescription.MIMETYPE_TEXT_URILIST }
+        val ext = mime?.let { android.webkit.MimeTypeMap.getSingleton().getExtensionFromMimeType(it) }
+        return ClipFileName.resolve(
+            displayName = queryDisplayName(context, uri),
+            lastPathSegment = uri.lastPathSegment,
+            extensionForMime = ext,
+            fallback = "file_${System.currentTimeMillis()}"
+        )
+    }
+
+    /** 等待剪贴板 URI 就绪的上限与轮询间隔 */
+    private val URI_READY_TIMEOUT_MS = 10_000L
+    private val URI_READY_POLL_MS = 300L
+
+    /**
+     * URI 指向的文件是否已可读。只有明确证据（MediaStore 待发布/查不到，或大小为 0）才判为未就绪，
+     * 查询失败或大小未知按就绪处理，保持原有行为。
+     */
+    private fun isUriReady(context: Context, uri: android.net.Uri): Boolean {
+        if (uri.authority == android.provider.MediaStore.AUTHORITY) {
+            return try {
+                context.contentResolver.query(
+                    uri,
+                    arrayOf(
+                        android.provider.MediaStore.MediaColumns.IS_PENDING,
+                        android.provider.MediaStore.MediaColumns.SIZE
+                    ),
+                    null, null, null
+                )?.use { cursor ->
+                    // 待发布的条目对非所有者可能完全不可见
+                    if (!cursor.moveToFirst()) return@use false
+                    val pending = !cursor.isNull(0) && cursor.getInt(0) != 0
+                    val size = if (cursor.isNull(1)) null else cursor.getLong(1)
+                    !pending && size != 0L
+                } ?: true
+            } catch (_: Exception) { true }
+        }
+        return queryFileSize(context, uri) != 0L
+    }
+
+    /**
+     * 等待剪贴板 URI 就绪后再读取。
+     *
+     * HyperOS 截图（含 HyperCeiler「截图自动写入剪贴板」）会先把 MediaStore 条目放进剪贴板，
+     * 此时条目仍是待发布状态、大小为 0，约 3.5 秒后截图程序才发布文件。
+     * 这里监听该 URI 的变化通知，发布后立即返回；另以短间隔轮询兜底（通知可能落在别名 URI 上）。
+     *
+     * @return true 继续处理；false 放弃（剪贴板已变化，或 MediaStore 条目超时仍未发布）
+     */
+    private suspend fun awaitUriReady(
+        context: Context,
+        uri: android.net.Uri,
+        isStale: () -> Boolean
+    ): Boolean {
+        if (isUriReady(context, uri)) return true
+        Logger.debug(TAG, "Clip URI not published yet, waiting up to ${URI_READY_TIMEOUT_MS}ms")
+        val started = System.currentTimeMillis()
+        val signal = Channel<Unit>(Channel.CONFLATED)
+        val observer = object : android.database.ContentObserver(null) {
+            override fun onChange(selfChange: Boolean) {
+                signal.trySend(Unit)
+            }
+        }
+        val registered = runCatching {
+            context.contentResolver.registerContentObserver(uri, false, observer)
+        }.isSuccess
+        try {
+            val ready: Boolean? = withTimeoutOrNull(URI_READY_TIMEOUT_MS) {
+                var result: Boolean? = null
+                while (result == null) {
+                    withTimeoutOrNull(URI_READY_POLL_MS) { signal.receive() }
+                    result = when {
+                        isStale() -> false
+                        isUriReady(context, uri) -> true
+                        else -> null
+                    }
+                }
+                result
+            }
+            val waited = System.currentTimeMillis() - started
+            return when (ready) {
+                true -> {
+                    Logger.debug(TAG, "Clip URI ready after ${waited}ms")
+                    true
+                }
+                false -> {
+                    Logger.debug(TAG, "Clipboard changed while waiting for URI, dropping old clip")
+                    false
+                }
+                null -> {
+                    // MediaStore 条目超时仍未发布：读到的只会是空数据，放弃；其他 provider 保持原行为继续
+                    val isMedia = uri.authority == android.provider.MediaStore.AUTHORITY
+                    val action = if (isMedia) "skipping" else "continuing anyway"
+                    Logger.warn(TAG, "Clip URI still not ready after ${waited}ms, $action")
+                    !isMedia
+                }
+            }
+        } finally {
+            if (registered) runCatching { context.contentResolver.unregisterContentObserver(observer) }
+            signal.close()
+        }
     }
 
     /**
